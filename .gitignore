@@ -1,0 +1,12 @@
+build/
+**/build/
+*.obj
+*.o
+*.pdb
+*.ilk
+*.exp
+*.lib
+*.dll
+*.so
+*.zip
+.DS_Store
