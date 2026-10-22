@@ -133,6 +133,7 @@ class SeleniteSource : public ModuleManager::Instance {
     Cat cat;
     double frequency = 7100000.0;
     bool invertQ = false;
+    bool catEnabled = false; // Explicit opt-in; never send CAT by default.
     bool enabled = true;
 
     void refresh() {
@@ -210,6 +211,7 @@ class SeleniteSource : public ModuleManager::Instance {
         SmGui::FillWidth();
         if (SmGui::Button(("Refresh##_selenite_" + s->name).c_str())) s->refresh();
         SmGui::InputText(("CAT port##_selenite_" + s->name).c_str(), s->port, sizeof(s->port));
+        SmGui::Checkbox(("Enable CAT##_selenite_" + s->name).c_str(), &s->catEnabled);
         SmGui::Checkbox(("Invert Q##_selenite_" + s->name).c_str(), &s->invertQ);
         if (s->running) SmGui::EndDisabled();
     }
@@ -218,7 +220,7 @@ class SeleniteSource : public ModuleManager::Instance {
         if (s->running || s->devices.empty()) return;
         {
             std::lock_guard<std::mutex> lock(s->catMutex);
-            if (!s->cat.open(s->port))
+            if (s->catEnabled && !s->cat.open(s->port))
                 flog::warn("Selenite: CAT unavailable; IQ capture will still run");
             // Do not tune on Play; wait for an explicit SDR++ tune callback.
         }
@@ -246,7 +248,7 @@ class SeleniteSource : public ModuleManager::Instance {
             return;
         }
         s->frequency = freq;
-        if (!s->running) return;
+        if (!s->running || !s->catEnabled) return;
         std::lock_guard<std::mutex> lock(s->catMutex);
         if (!s->cat.tune(hz)) flog::warn("Selenite: CAT tuning failed");
     }
