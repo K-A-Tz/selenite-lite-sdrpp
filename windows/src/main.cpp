@@ -127,6 +127,7 @@ class SeleniteSource : public ModuleManager::Instance {
     Cat cat;
     double frequency = 7100000.0;
     bool invertIQ = false;
+    bool catEnabled = false; // Explicit opt-in; never send CAT by default.
     bool enabled = true;
 
     void refresh() {
@@ -209,13 +210,17 @@ class SeleniteSource : public ModuleManager::Instance {
         SmGui::FillWidth();
         if (SmGui::Button(("Refresh##_selenite_"+s->name).c_str())) s->refresh();
         SmGui::InputText(("CAT port##_selenite_"+s->name).c_str(), s->port, sizeof(s->port));
+        SmGui::Checkbox(("Enable CAT##_selenite_" + s->name).c_str(), &s->catEnabled);
         SmGui::Checkbox(("Invert Q##_selenite_"+s->name).c_str(), &s->invertIQ);
         if (s->running) SmGui::EndDisabled();
     }
     static void start(void* ctx) {
         auto* s=(SeleniteSource*)ctx;
         if (s->running || s->devices.empty()) return;
-        { std::lock_guard<std::mutex> lock(s->catMutex); if (!s->cat.open(s->port)) flog::error("Selenite: CAT unavailable; IQ capture will still run"); }
+        if (s->catEnabled) {
+            std::lock_guard<std::mutex> lock(s->catMutex);
+            if (!s->cat.open(s->port)) flog::error("Selenite: CAT unavailable; IQ capture will still run");
+        }
         s->running=true;
         s->captureThread=std::thread([s](){s->capture();});
     }
@@ -239,7 +244,7 @@ class SeleniteSource : public ModuleManager::Instance {
             return;
         }
         s->frequency = freq;
-        if (!s->running) return;
+        if (!s->running || !s->catEnabled) return;
         std::lock_guard<std::mutex> lock(s->catMutex);
         if (!s->cat.tune(hz)) flog::warn("Selenite: CAT tuning failed");
     }
