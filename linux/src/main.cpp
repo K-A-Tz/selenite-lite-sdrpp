@@ -15,6 +15,7 @@
 #include <string>
 #include <vector>
 #include <cmath>
+#include <cstdio>
 #include <cstring>
 #include <algorithm>
 #include <cstdint>
@@ -87,7 +88,7 @@ public:
         return true;
     }
     bool tune(uint64_t hz) {
-        if (fd < 0 || hz > 999999990ULL) return false;
+        if (fd < 0 || hz < 1500000ULL || hz > 32000000ULL) return false;
         uint64_t units = (hz + 5) / 10;
         uint8_t cmd[5]{};
         for (int i = 3; i >= 0; --i) {
@@ -96,6 +97,12 @@ public:
             cmd[i] = (hi << 4) | lo;
         }
         cmd[4] = 0x01;
+        char catPacket[64];
+        std::snprintf(catPacket, sizeof(catPacket), "%02X %02X %02X %02X %02X",
+                      static_cast<unsigned>(cmd[0]), static_cast<unsigned>(cmd[1]),
+                      static_cast<unsigned>(cmd[2]), static_cast<unsigned>(cmd[3]),
+                      static_cast<unsigned>(cmd[4]));
+        flog::info("Selenite: CAT SET {} Hz, packet {}", std::to_string(hz), std::string(catPacket));
         size_t sent = 0;
         while (sent < sizeof(cmd)) {
             ssize_t n = ::write(fd, cmd + sent, sizeof(cmd) - sent);
@@ -213,7 +220,7 @@ class SeleniteSource : public ModuleManager::Instance {
             std::lock_guard<std::mutex> lock(s->catMutex);
             if (!s->cat.open(s->port))
                 flog::warn("Selenite: CAT unavailable; IQ capture will still run");
-            else s->cat.tune(static_cast<uint64_t>(std::llround(s->frequency)));
+            // Do not tune on Play; wait for an explicit SDR++ tune callback.
         }
         s->running = true;
         s->captureThread = std::thread([s] { s->capture(); });
@@ -229,11 +236,19 @@ class SeleniteSource : public ModuleManager::Instance {
     }
     static void tune(double freq, void* ctx) {
         auto* s = static_cast<SeleniteSource*>(ctx);
+        if (!std::isfinite(freq) || freq < 1500000.0 || freq > 32000000.0) {
+            flog::warn("Selenite: rejected out-of-range CAT frequency {} Hz", std::to_string(freq));
+            return;
+        }
+        const uint64_t hz = static_cast<uint64_t>(std::llround(freq));
+        if (hz < 1500000ULL || hz > 32000000ULL) {
+            flog::warn("Selenite: rejected rounded CAT frequency {} Hz", std::to_string(hz));
+            return;
+        }
         s->frequency = freq;
         if (!s->running) return;
         std::lock_guard<std::mutex> lock(s->catMutex);
-        if (!s->cat.tune(static_cast<uint64_t>(std::llround(freq))))
-            flog::warn("Selenite: CAT tuning failed");
+        if (!s->cat.tune(hz)) flog::warn("Selenite: CAT tuning failed");
     }
 public:
     explicit SeleniteSource(std::string n) : name(std::move(n)) {
