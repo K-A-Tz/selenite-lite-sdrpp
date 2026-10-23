@@ -134,6 +134,7 @@ class SeleniteSource : public ModuleManager::Instance {
     double frequency = 7100000.0;
     bool invertQ = false;
     bool catEnabled = false; // Explicit opt-in; never send CAT by default.
+    int catOffsetHz = 10000; // Synthesizer frequency = SDR++ frequency + offset.
     bool enabled = true;
 
     void refresh() {
@@ -212,6 +213,7 @@ class SeleniteSource : public ModuleManager::Instance {
         if (SmGui::Button(("Refresh##_selenite_" + s->name).c_str())) s->refresh();
         SmGui::InputText(("CAT port##_selenite_" + s->name).c_str(), s->port, sizeof(s->port));
         SmGui::Checkbox(("Enable CAT##_selenite_" + s->name).c_str(), &s->catEnabled);
+        SmGui::InputInt(("CAT offset (Hz)##_selenite_" + s->name).c_str(), &s->catOffsetHz);
         SmGui::Checkbox(("Invert Q##_selenite_" + s->name).c_str(), &s->invertQ);
         if (s->running) SmGui::EndDisabled();
     }
@@ -238,19 +240,24 @@ class SeleniteSource : public ModuleManager::Instance {
     }
     static void tune(double freq, void* ctx) {
         auto* s = static_cast<SeleniteSource*>(ctx);
-        if (!std::isfinite(freq) || freq < 1500000.0 || freq > 32000000.0) {
-            flog::warn("Selenite: rejected out-of-range CAT frequency {} Hz", std::to_string(freq));
+        // Validate the final synthesizer frequency, not the SDR++ display frequency.
+        // Compute in double before conversion to avoid overflow for invalid input.
+        const double synthFreq = freq + static_cast<double>(s->catOffsetHz);
+        if (!std::isfinite(freq) || !std::isfinite(synthFreq) ||
+            synthFreq < 1500000.0 || synthFreq > 32000000.0) {
+            flog::warn("Selenite: rejected CAT tune (SDR++ {} Hz, offset {} Hz)",
+                       std::to_string(freq), std::to_string(s->catOffsetHz));
             return;
         }
-        const uint64_t hz = static_cast<uint64_t>(std::llround(freq));
-        if (hz < 1500000ULL || hz > 32000000ULL) {
-            flog::warn("Selenite: rejected rounded CAT frequency {} Hz", std::to_string(hz));
+        const uint64_t synthHz = static_cast<uint64_t>(std::llround(synthFreq));
+        if (synthHz < 1500000ULL || synthHz > 32000000ULL) {
+            flog::warn("Selenite: rejected rounded synthesizer frequency {} Hz", std::to_string(synthHz));
             return;
         }
         s->frequency = freq;
         if (!s->running || !s->catEnabled) return;
         std::lock_guard<std::mutex> lock(s->catMutex);
-        if (!s->cat.tune(hz)) flog::warn("Selenite: CAT tuning failed");
+        if (!s->cat.tune(synthHz)) flog::warn("Selenite: CAT tuning failed");
     }
 public:
     explicit SeleniteSource(std::string n) : name(std::move(n)) {
