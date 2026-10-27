@@ -18,6 +18,7 @@
 #include <cstdio>
 #include <cstring>
 #include <algorithm>
+#include <chrono>
 
 SDRPP_MOD_INFO{
     /* Name */ "selenite_source",
@@ -125,6 +126,8 @@ class SeleniteSource : public ModuleManager::Instance {
     std::thread captureThread;
     std::mutex catMutex;
     Cat cat;
+    uint64_t lastCatHz = 0;
+    std::chrono::steady_clock::time_point lastCatSent{};
     double frequency = 7100000.0;
     bool invertIQ = false;
     bool catEnabled = true; // CAT enabled by default; user may disable it before Play.
@@ -219,6 +222,8 @@ class SeleniteSource : public ModuleManager::Instance {
         if (s->running || s->devices.empty()) return;
         if (s->catEnabled) {
             std::lock_guard<std::mutex> lock(s->catMutex);
+            s->lastCatHz = 0;
+            s->lastCatSent = {};
             if (!s->cat.open(s->port)) flog::error("Selenite: CAT unavailable; IQ capture will still run");
         }
         s->running=true;
@@ -249,7 +254,20 @@ class SeleniteSource : public ModuleManager::Instance {
         s->frequency = freq;
         if (!s->running || !s->catEnabled) return;
         std::lock_guard<std::mutex> lock(s->catMutex);
-        if (!s->cat.tune(hz)) flog::warn("Selenite: CAT tuning failed");
+        // Suppress repeated frequencies and space serial packets by at least 50 ms.
+        if (hz == s->lastCatHz) return;
+        constexpr auto minCatInterval = std::chrono::milliseconds(50);
+        if (s->lastCatSent != std::chrono::steady_clock::time_point{}) {
+            const auto nextSend = s->lastCatSent + minCatInterval;
+            const auto now = std::chrono::steady_clock::now();
+            if (now < nextSend) std::this_thread::sleep_until(nextSend);
+        }
+        if (!s->cat.tune(hz)) {
+            flog::warn("Selenite: CAT tuning failed");
+        } else {
+            s->lastCatHz = hz;
+            s->lastCatSent = std::chrono::steady_clock::now();
+        }
     }
 public:
     explicit SeleniteSource(std::string n):name(std::move(n)) {
