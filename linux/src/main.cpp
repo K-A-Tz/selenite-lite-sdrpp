@@ -134,6 +134,7 @@ class SeleniteSource : public ModuleManager::Instance {
     double frequency = 7100000.0;
     bool invertQ = false;
     bool catEnabled = true; // CAT enabled by default; user may disable it before Play.
+    bool catDiagnostic = true; // Safe default: log CAT requests without opening serial or transmitting.
     bool enabled = true;
 
     void refresh() {
@@ -212,6 +213,7 @@ class SeleniteSource : public ModuleManager::Instance {
         if (SmGui::Button(("Refresh##_selenite_" + s->name).c_str())) s->refresh();
         SmGui::InputText(("CAT port##_selenite_" + s->name).c_str(), s->port, sizeof(s->port));
         SmGui::Checkbox(("Enable CAT##_selenite_" + s->name).c_str(), &s->catEnabled);
+        SmGui::Checkbox(("CAT diagnostic (no TX)##_selenite_" + s->name).c_str(), &s->catDiagnostic);
         SmGui::Checkbox(("Invert Q##_selenite_" + s->name).c_str(), &s->invertQ);
         if (s->running) SmGui::EndDisabled();
     }
@@ -220,7 +222,7 @@ class SeleniteSource : public ModuleManager::Instance {
         if (s->running || s->devices.empty()) return;
         {
             std::lock_guard<std::mutex> lock(s->catMutex);
-            if (s->catEnabled && !s->cat.open(s->port))
+            if (s->catEnabled && !s->catDiagnostic && !s->cat.open(s->port))
                 flog::warn("Selenite: CAT unavailable; IQ capture will still run");
             // Do not tune on Play; wait for an explicit SDR++ tune callback.
         }
@@ -238,7 +240,9 @@ class SeleniteSource : public ModuleManager::Instance {
     }
     static void tune(double freq, void* ctx) {
         auto* s = static_cast<SeleniteSource*>(ctx);
-        // CAT uses the unmodified SDR++ frequency; never transmit out-of-band values.
+        // Log every callback, including unexpected values, before any CAT write.
+        flog::info("Selenite: tune callback {} Hz (running={}, CAT={}, diagnostic={})",
+                   std::to_string(freq), s->running.load(), s->catEnabled, s->catDiagnostic);
         if (!std::isfinite(freq) || freq < 1500000.0 || freq > 32000000.0) {
             flog::warn("Selenite: rejected out-of-range CAT frequency {} Hz", std::to_string(freq));
             return;
@@ -250,6 +254,10 @@ class SeleniteSource : public ModuleManager::Instance {
         }
         s->frequency = freq;
         if (!s->running || !s->catEnabled) return;
+        if (s->catDiagnostic) {
+            flog::info("Selenite: CAT diagnostic only, would tune {} Hz (no serial write)", std::to_string(hz));
+            return;
+        }
         std::lock_guard<std::mutex> lock(s->catMutex);
         if (!s->cat.tune(hz)) flog::warn("Selenite: CAT tuning failed");
     }
