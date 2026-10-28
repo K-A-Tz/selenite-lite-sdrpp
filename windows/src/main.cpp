@@ -86,7 +86,7 @@ public:
         if (h == INVALID_HANDLE_VALUE) { flog::error("Selenite: CAT open failed {}", std::to_string(GetLastError())); return false; }
         DCB d{}; d.DCBlength = sizeof(d);
         if (!GetCommState(h, &d)) { close(); return false; }
-        d.BaudRate = CBR_9600; d.ByteSize = 8; d.Parity = NOPARITY; d.StopBits = ONESTOPBIT;
+        d.BaudRate = CBR_9600; d.ByteSize = 8; d.Parity = NOPARITY; d.StopBits = TWOSTOPBITS;
         d.fBinary = TRUE; d.fParity = FALSE; d.fOutxCtsFlow = FALSE; d.fOutxDsrFlow = FALSE;
         d.fDtrControl = DTR_CONTROL_DISABLE; d.fRtsControl = RTS_CONTROL_DISABLE;
         d.fOutX = FALSE; d.fInX = FALSE;
@@ -107,9 +107,16 @@ public:
                       static_cast<unsigned>(cmd[2]), static_cast<unsigned>(cmd[3]),
                       static_cast<unsigned>(cmd[4]));
         flog::info("Selenite: CAT SET {} Hz, packet {}", std::to_string(hz), std::string(catPacket));
-        DWORD wrote=0;
-        if (!WriteFile(h, cmd, 5, &wrote, nullptr) || wrote != 5) return false;
-        // Some firmware builds return an ACK; do not block reception if no ACK is provided.
+        // FT-817-compatible Selenite firmware requires 200 ms between bytes.
+        // Keep the command bytes in order; do not pause after the final opcode.
+        for (int i = 0; i < 5; ++i) {
+            DWORD wrote = 0;
+            if (!WriteFile(h, &cmd[i], 1, &wrote, nullptr) || wrote != 1) {
+                flog::error("Selenite: CAT byte {} write failed", std::to_string(i + 1));
+                return false;
+            }
+            if (i != 4) std::this_thread::sleep_for(std::chrono::milliseconds(200));
+        }
         return true;
     }
 };
@@ -154,13 +161,17 @@ class SeleniteSource : public ModuleManager::Instance {
             const uint64_t hz = pendingCatHz;
             catPending = false;
             if (hz == lastCatHz) continue;
-            // Only this worker writes to the serial port; no SDR++ callback waits.
-            if (!cat.tune(hz)) {
+            // Do not hold catMutex during the ~800 ms transmission.
+            // New tune callbacks can replace the pending frequency immediately.
+            lock.unlock();
+            const bool sent = cat.tune(hz);
+            lock.lock();
+            if (!sent) {
                 flog::warn("Selenite: CAT tuning failed");
             } else {
                 lastCatHz = hz;
             }
-            // Apply the interval even after failed writes to avoid hammering firmware.
+            // Extra 200 ms guard after the completed frame.
             lastCatSent = std::chrono::steady_clock::now();
         }
     }
