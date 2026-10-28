@@ -19,6 +19,7 @@
 #include <cstring>
 #include <algorithm>
 #include <chrono>
+#include <condition_variable>
 
 SDRPP_MOD_INFO{
     /* Name */ "selenite_source",
@@ -125,7 +126,12 @@ class SeleniteSource : public ModuleManager::Instance {
     std::atomic<bool> running{false};
     std::thread captureThread;
     std::mutex catMutex;
+    std::condition_variable catCv;
+    std::thread catThread;
     Cat cat;
+    bool catWorkerStop = false;
+    bool catPending = false;
+    uint64_t pendingCatHz = 0;
     uint64_t lastCatHz = 0;
     std::chrono::steady_clock::time_point lastCatSent{};
     double frequency = 7100000.0;
@@ -133,6 +139,31 @@ class SeleniteSource : public ModuleManager::Instance {
     bool catEnabled = true; // CAT enabled by default; user may disable it before Play.
     bool enabled = true;
 
+    void catWorker() {
+        std::unique_lock<std::mutex> lock(catMutex);
+        constexpr auto minCatInterval = std::chrono::milliseconds(200);
+        while (!catWorkerStop) {
+            catCv.wait(lock, [this] { return catWorkerStop || catPending; });
+            if (catWorkerStop) break;
+            if (lastCatSent != std::chrono::steady_clock::time_point{}) {
+                auto nextSend = lastCatSent + minCatInterval;
+                // New tune requests overwrite pendingCatHz while waiting.
+                catCv.wait_until(lock, nextSend, [this] { return catWorkerStop; });
+                if (catWorkerStop) break;
+            }
+            const uint64_t hz = pendingCatHz;
+            catPending = false;
+            if (hz == lastCatHz) continue;
+            // Only this worker writes to the serial port; no SDR++ callback waits.
+            if (!cat.tune(hz)) {
+                flog::warn("Selenite: CAT tuning failed");
+            } else {
+                lastCatHz = hz;
+            }
+            // Apply the interval even after failed writes to avoid hammering firmware.
+            lastCatSent = std::chrono::steady_clock::now();
+        }
+    }
     void refresh() {
         devices = listInputs(); devicesCombo.clear();
         for (size_t i=0;i<devices.size();++i) {
@@ -224,7 +255,10 @@ class SeleniteSource : public ModuleManager::Instance {
             std::lock_guard<std::mutex> lock(s->catMutex);
             s->lastCatHz = 0;
             s->lastCatSent = {};
+            s->catPending = false;
+            s->catWorkerStop = false;
             if (!s->cat.open(s->port)) flog::error("Selenite: CAT unavailable; IQ capture will still run");
+            else s->catThread = std::thread([s]() { s->catWorker(); });
         }
         s->running=true;
         s->captureThread=std::thread([s](){s->capture();});
@@ -235,7 +269,15 @@ class SeleniteSource : public ModuleManager::Instance {
         s->stream.stopWriter();
         if (s->captureThread.joinable()) s->captureThread.join();
         s->stream.clearWriteStop();
-        std::lock_guard<std::mutex> lock(s->catMutex); s->cat.close();
+        {
+            std::lock_guard<std::mutex> lock(s->catMutex);
+            s->catWorkerStop = true;
+            s->catPending = false;
+        }
+        s->catCv.notify_one();
+        if (s->catThread.joinable()) s->catThread.join();
+        std::lock_guard<std::mutex> lock(s->catMutex);
+        s->cat.close();
     }
     static void tune(double freq, void* ctx) {
         auto* s = static_cast<SeleniteSource*>(ctx);
@@ -253,21 +295,14 @@ class SeleniteSource : public ModuleManager::Instance {
         }
         s->frequency = freq;
         if (!s->running || !s->catEnabled) return;
-        std::lock_guard<std::mutex> lock(s->catMutex);
-        // Suppress repeated frequencies and space serial packets by at least 50 ms.
-        if (hz == s->lastCatHz) return;
-        constexpr auto minCatInterval = std::chrono::milliseconds(50);
-        if (s->lastCatSent != std::chrono::steady_clock::time_point{}) {
-            const auto nextSend = s->lastCatSent + minCatInterval;
-            const auto now = std::chrono::steady_clock::now();
-            if (now < nextSend) std::this_thread::sleep_until(nextSend);
+        {
+            std::lock_guard<std::mutex> lock(s->catMutex);
+            if (!s->catThread.joinable() || s->catWorkerStop) return;
+            if (!s->catPending && hz == s->lastCatHz) return;
+            s->pendingCatHz = hz;
+            s->catPending = true;
         }
-        if (!s->cat.tune(hz)) {
-            flog::warn("Selenite: CAT tuning failed");
-        } else {
-            s->lastCatHz = hz;
-            s->lastCatSent = std::chrono::steady_clock::now();
-        }
+        s->catCv.notify_one();
     }
 public:
     explicit SeleniteSource(std::string n):name(std::move(n)) {
